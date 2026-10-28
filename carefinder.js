@@ -149,7 +149,23 @@
     return null;
   }
 
+  // Listings that share a map point (many sit on the centre of their postal-code area) become one pin.
+  function groupByLocation(items) {
+    var byKey = {};
+    var groups = [];
+    var missing = 0;
+    items.forEach(function (item) {
+      var r = item.r;
+      if (r.lat === null || r.lng === null || r.lat === undefined || r.lng === undefined) { missing += 1; return; }
+      var key = r.lat.toFixed(4) + ',' + r.lng.toFixed(4);
+      if (!byKey[key]) { byKey[key] = { lat: r.lat, lng: r.lng, items: [] }; groups.push(byKey[key]); }
+      byKey[key].items.push(item);
+    });
+    return { groups: groups, missing: missing };
+  }
+
   var api = {
+    groupByLocation: groupByLocation,
     applyFilters: applyFilters, subOptions: subOptions, languageOptions: languageOptions,
     pageList: pageList, truncate: truncate, extractPoint: extractPoint, haversineKm: haversineKm,
   };
@@ -163,6 +179,13 @@
   var API_URL = cfg.api || root.getAttribute('data-api') || '';
   var GEO_URL = cfg.geolocator || 'https://geolocator.api.geo.ca/';
   var PAGE_SIZE = cfg.pageSize || 10;
+  // Map: Leaflet is loaded only when someone opens Map View. Integrity hashes are the ones published by leafletjs.com for 1.9.4.
+  var LEAFLET = cfg.leaflet || {
+    css: 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css', cssIntegrity: 'sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=',
+    js: 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js', jsIntegrity: 'sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=',
+  };
+  var TILE_URL = cfg.tileUrl || 'https://tile.openstreetmap.org/{z}/{x}/{y}.png';
+  var TILE_ATTRIBUTION = cfg.tileAttribution || '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors';
 
   // ---------- styles ----------
   var CSS = [
@@ -238,6 +261,24 @@
     '.cf-top-btn{position:fixed;right:24px;bottom:24px;width:52px;height:52px;border-radius:50%;border:0;background:var(--cf-blue);color:#fff;cursor:pointer;display:none;align-items:center;justify-content:center;box-shadow:0 4px 14px rgba(20,30,60,.3);z-index:50}',
     '.cf-top-btn.cf-show{display:flex}',
     '.cf-loading{padding:48px 0;text-align:center;color:var(--cf-muted);font-size:18px}',
+    /* view toggle + map */
+    '.cf-toggle{display:inline-flex;background:#DADDE5;border-radius:999px;padding:4px}',
+    '.cf-toggle button{border:0;border-radius:999px;padding:10px 22px;font-weight:800;font-size:16px;cursor:pointer;background:transparent;color:var(--cf-blue)}',
+    '.cf-toggle button[aria-pressed="true"]{background:var(--cf-coral);color:#fff}',
+    '.cf-narrowrow{margin:0 0 4px}',
+    '.cf-map-wrap[hidden],.cf-list[hidden],.cf-pages[hidden]{display:none}',
+    '.cf-map{height:600px;border-radius:14px;overflow:hidden;background:#E6E8EC;border:1px solid var(--cf-line)}',
+    '.cf .leaflet-container img{max-width:none!important;max-height:none!important}',
+    '.cf .leaflet-container{font-family:inherit}',
+    '.cf-pin-wrap{background:transparent;border:0}',
+    '.cf-pin{display:flex;align-items:center;justify-content:center;width:100%;height:100%;border-radius:50%;background:var(--cf-blue);border:3px solid #fff;box-shadow:0 1px 6px rgba(15,25,60,.45);color:#fff;font-weight:800;font-size:14px}',
+    '.cf-pop{min-width:210px;max-width:300px}',
+    '.cf-pop-list{max-height:240px;overflow:auto;margin:0;padding:0;list-style:none;display:grid;gap:14px}',
+    '.cf-pop-name{margin:0 0 2px;font-weight:800;color:var(--cf-blue);font-size:16px;line-height:1.25}',
+    '.cf-pop-meta{margin:0 0 4px;font-size:14px;color:var(--cf-muted)}',
+    '.cf-pop-links{display:flex;flex-wrap:wrap;gap:4px 12px;font-weight:700;font-size:14px}',
+    '.cf-pop-more{margin:8px 0 0;font-size:14px;color:var(--cf-muted)}',
+    '@media (max-width:900px){.cf-map{height:440px}}',
     '@media (max-width:900px){.cf-intro{grid-template-columns:1fr}.cf-selects,.cf-narrow{grid-template-columns:1fr}.cf-loc{grid-template-columns:1fr}.cf-body{grid-template-columns:1fr}.cf-filterhead h2{font-size:30px}.cf-count{font-size:26px}}',
     '@media (prefers-reduced-motion:reduce){.cf *{transition:none!important}}',
   ].join('\n');
@@ -282,7 +323,7 @@
   // ---------- state ----------
   var state = {
     all: [], group: '', sub: '', kw: '', delivery: new Set(), cost: new Set(), lang: new Set(),
-    loc: null, km: 100, page: 1, open: {},
+    loc: null, km: 100, page: 1, open: {}, view: 'list',
   };
   var els = {};
 
@@ -372,6 +413,8 @@
       slice.forEach(function (item, i) { els.list.appendChild(renderCard(item, i)); });
     }
 
+    if (state.view === 'map') drawMap(results);
+
     els.pages.textContent = '';
     if (pages > 1) {
       var go = function (p) { state.page = p; render(); root.scrollIntoView({ behavior: 'auto', block: 'start' }); };
@@ -385,6 +428,96 @@
       });
       els.pages.appendChild(h('button', { type: 'button', text: 'Next', disabled: state.page === pages, onclick: function () { go(state.page + 1); } }));
     }
+  }
+
+  // ---------- map view ----------
+  var leafletPromise = null;
+  function loadLeaflet() {
+    if (window.L && window.L.map) return Promise.resolve(window.L);
+    if (!leafletPromise) {
+      leafletPromise = new Promise(function (resolve, reject) {
+        document.head.appendChild(h('link', { rel: 'stylesheet', href: LEAFLET.css, integrity: LEAFLET.cssIntegrity, crossorigin: '' }));
+        var js = h('script', { src: LEAFLET.js, integrity: LEAFLET.jsIntegrity, crossorigin: '' });
+        js.addEventListener('load', function () { if (window.L && window.L.map) resolve(window.L); else { leafletPromise = null; reject(new Error('Leaflet missing')); } });
+        js.addEventListener('error', function () { leafletPromise = null; reject(new Error('Leaflet blocked')); });
+        document.head.appendChild(js);
+      });
+    }
+    return leafletPromise;
+  }
+
+  var mapState = null;
+  function popupFor(group) {
+    var MAX = 25;
+    var shown = group.items.slice(0, MAX);
+    var list = h('ul', { class: 'cf-pop-list' }, shown.map(function (item) {
+      var r = item.r;
+      var links = [];
+      if (r.phone) links.push(h('a', { href: phoneHref(r.phone), text: r.phone }));
+      if (r.email) links.push(h('a', { href: 'mailto:' + r.email, text: r.email }));
+      if (r.website && /^https?:\/\//i.test(r.website)) links.push(h('a', { href: r.website, target: '_blank', rel: 'noopener noreferrer', text: siteLabel(r.website) }));
+      return h('li', null, [
+        h('p', { class: 'cf-pop-name', text: r.name }),
+        h('p', { class: 'cf-pop-meta', text: locationLabel(r) }),
+        links.length ? h('div', { class: 'cf-pop-links' }, links) : null,
+      ]);
+    }));
+    return h('div', { class: 'cf-pop' }, [
+      list,
+      group.items.length > MAX ? h('p', { class: 'cf-pop-more', text: (group.items.length - MAX) + ' more at this location. Use List View to see them all.' }) : null,
+    ]);
+  }
+
+  function drawMap(results) {
+    var grouped = groupByLocation(results);
+    var shown = results.length - grouped.missing;
+    els.mapNote.className = 'cf-status';
+    els.mapNote.textContent = shown + (shown === 1 ? ' listing is' : ' listings are') + ' shown on the map.'
+      + (grouped.missing ? ' ' + grouped.missing + (grouped.missing === 1 ? ' listing has' : ' listings have') + ' no map location. Use List View to see ' + (grouped.missing === 1 ? 'it' : 'them') + '.' : '');
+    loadLeaflet().then(function (L) {
+      if (state.view !== 'map') return;
+      if (!mapState) {
+        var map = L.map(els.mapEl, { scrollWheelZoom: false });
+        L.tileLayer(TILE_URL, { maxZoom: 18, attribution: TILE_ATTRIBUTION }).addTo(map);
+        mapState = { map: map, layer: L.layerGroup().addTo(map) };
+      }
+      var map = mapState.map;
+      map.invalidateSize();
+      mapState.layer.clearLayers();
+      var points = [];
+      grouped.groups.forEach(function (g) {
+        var n = g.items.length;
+        var size = n > 1 ? 36 : 24;
+        var icon = L.divIcon({ className: 'cf-pin-wrap', html: '<span class="cf-pin">' + (n > 1 ? n : '') + '</span>', iconSize: [size, size], iconAnchor: [size / 2, size / 2], popupAnchor: [0, -size / 2] });
+        var marker = L.marker([g.lat, g.lng], { icon: icon, title: g.items[0].r.name + (n > 1 ? ' and ' + (n - 1) + ' more' : ''), keyboard: true });
+        marker.bindPopup(popupFor(g), { maxWidth: 320 });
+        mapState.layer.addLayer(marker);
+        points.push([g.lat, g.lng]);
+      });
+      if (state.loc) {
+        mapState.layer.addLayer(L.circle([state.loc.lat, state.loc.lng], { radius: state.km * 1000, color: '#E25744', weight: 1.5, fillOpacity: 0.04, interactive: false }));
+        mapState.layer.addLayer(L.circleMarker([state.loc.lat, state.loc.lng], { radius: 7, color: '#ffffff', weight: 2, fillColor: '#E25744', fillOpacity: 1 }).bindTooltip('Your search location'));
+        points.push([state.loc.lat, state.loc.lng]);
+      }
+      if (points.length > 1) map.fitBounds(L.latLngBounds(points), { padding: [30, 30], maxZoom: 12 });
+      else if (points.length === 1) map.setView(points[0], 11);
+      else map.setView([56, -96], 3);
+    }).catch(function () {
+      els.mapNote.className = 'cf-status cf-err';
+      els.mapNote.textContent = 'The map could not be loaded. Use List View instead.';
+    });
+  }
+
+  function setView(v) {
+    state.view = v;
+    els.viewList.setAttribute('aria-pressed', v === 'list' ? 'true' : 'false');
+    els.viewMap.setAttribute('aria-pressed', v === 'map' ? 'true' : 'false');
+    if (v === 'map') {
+      els.list.setAttribute('hidden', ''); els.pages.setAttribute('hidden', ''); els.mapWrap.removeAttribute('hidden');
+    } else {
+      els.mapWrap.setAttribute('hidden', ''); els.list.removeAttribute('hidden'); els.pages.removeAttribute('hidden');
+    }
+    render();
   }
 
   function refresh() { state.page = 1; render(); }
@@ -499,6 +632,13 @@
       h('div', { class: 'cf-range' }, [kmLabel, els.km]),
     ]);
 
+    els.viewList = h('button', { type: 'button', 'aria-pressed': 'true', text: 'List View', onclick: function () { setView('list'); } });
+    els.viewMap = h('button', { type: 'button', 'aria-pressed': 'false', text: 'Map View', onclick: function () { setView('map'); } });
+    var toggle = h('div', { class: 'cf-toggle', role: 'group', 'aria-label': 'Choose how to view results' }, [els.viewList, els.viewMap]);
+    els.mapNote = h('p', { class: 'cf-status', 'aria-live': 'polite' });
+    els.mapEl = h('div', { class: 'cf-map', role: 'region', 'aria-label': 'Map of CareFinder listings' });
+    els.mapWrap = h('div', { class: 'cf-map-wrap', hidden: true }, [els.mapNote, els.mapEl]);
+
     var topBtn = h('button', { type: 'button', class: 'cf-top-btn', 'aria-label': 'Back to top', onclick: function () { root.scrollIntoView({ behavior: 'smooth', block: 'start' }); } }, [icon(UP, 24)]);
     window.addEventListener('scroll', function () {
       if (window.scrollY > 700) topBtn.classList.add('cf-show'); else topBtn.classList.remove('cf-show');
@@ -511,11 +651,13 @@
       ]),
       h('div', { class: 'cf-selects' }, [buildSelect('pro'), buildSelect('well'), buildSelect('sup')]),
       kwRow,
-      h('div', { class: 'cf-bar' }, [els.count, narrowBtn]),
+      h('div', { class: 'cf-bar' }, [els.count, toggle]),
+      h('div', { class: 'cf-narrowrow' }, [narrowBtn]),
       narrow,
       locBlock,
       els.status,
       els.list,
+      els.mapWrap,
       els.pages,
     ]);
     root.textContent = '';
