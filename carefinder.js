@@ -34,15 +34,230 @@
     return false;
   }
 
-  function haystack(r) {
-    return [r.name, r.description, r.expertise, r.city, r.province, r.postal,
-      r.subs.pro.join(' '), r.subs.well.join(' '), r.subs.sup.join(' ')].join(' ').toLowerCase();
+  // ---------- search engine ----------
+  // One search box. The words typed are split into WHAT (service words) and WHERE (a postal code, a city or a province),
+  // matched with word endings, synonyms and small typos, and ranked by relevance.
+  var STOP = {};
+  ['in', 'near', 'around', 'at', 'for', 'the', 'a', 'an', 'and', 'of', 'to', 'with', 'my', 'me', 'please', 'within', 'close', 'by',
+    'from', 'find', 'looking', 'need', 'services', 'service', 'available', 'area'].forEach(function (w) { STOP[w] = true; });
+
+  // Spelling variants that should count as the same word, on both sides of the match.
+  var WORD_FIXES = {
+    counselling: 'counseling', counsellor: 'counselor', counsellors: 'counselors', dietician: 'dietitian', dieticians: 'dietitians',
+  };
+
+  // What people type -> other ways the same thing is written in the listings. Edit freely, or add more with
+  // window.CAREFINDER_CONFIG = { synonyms: { 'rock steady': ['boxing'] } }.
+  var SYNONYMS = {
+    'physio': ['physiotherapist', 'physical therapist'], 'pt': ['physiotherapist'],
+    'physical therapy': ['physiotherapist', 'physical therapist'], 'physical therapist': ['physiotherapist'],
+    'speech therapy': ['speech language pathologist', 'speech therapist'], 'speech therapist': ['speech language pathologist', 'speech therapy'],
+    'speech pathologist': ['speech language pathologist'], 'slp': ['speech language pathologist'],
+    'voice': ['speech language pathologist'], 'swallowing': ['speech language pathologist'], 'lsvt': ['speech language pathologist', 'physiotherapist'],
+    'ot': ['occupational therapist'], 'occupational therapy': ['occupational therapist'],
+    'counseling': ['counselor', 'psychotherapist', 'psychologist', 'social worker'],
+    'mental health': ['counseling', 'psychotherapist', 'psychiatrist', 'neuropsychologist'],
+    'psychologist': ['neuropsychologist', 'psychotherapist'],
+    'doctor': ['neurologist', 'movement disorder specialist', 'physician', 'geriatrician', 'psychiatrist'],
+    'specialist': ['neurologist', 'movement disorder specialist'],
+    'nutrition': ['dietitian', 'nutritionist'], 'dietitian': ['nutritionist'], 'nutritionist': ['dietitian'],
+    'exercise': ['boxing', 'dance', 'yoga', 'tai chi', 'kinesiologist'], 'fitness': ['exercise', 'boxing', 'dance', 'yoga', 'tai chi', 'kinesiologist'],
+    'gym': ['exercise', 'boxing', 'kinesiologist'],
+    'caregiver': ['care partner'], 'caregivers': ['care partner'], 'carer': ['care partner'], 'family': ['care partner'], 'spouse': ['care partner'],
+    'young onset': ['early onset'], 'early onset': ['young onset'],
+    'online': ['virtual'], 'telehealth': ['virtual'], 'zoom': ['virtual'], 'remote': ['virtual'],
+    'psw': ['home care'], 'homecare': ['home care'], 'personal support': ['home care'],
+    'music': ['music therapist'],
+  };
+
+  var PROV_CODES = {
+    AB: 'Alberta', BC: 'British Columbia', MB: 'Manitoba', NB: 'New Brunswick', NL: 'Newfoundland and Labrador', NS: 'Nova Scotia',
+    NT: 'Northwest Territories', NU: 'Nunavut', ON: 'Ontario', PE: 'Prince Edward Island', QC: 'Quebec', SK: 'Saskatchewan', YT: 'Yukon',
+  };
+
+  function norm(s) {
+    var t = String(s === null || s === undefined ? '' : s);
+    if (t.normalize) t = t.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+    return t.toLowerCase().replace(/&/g, ' and ').replace(/[^a-z0-9]+/g, ' ').replace(/^ +| +$/g, '');
+  }
+  function canon(w) { return WORD_FIXES[w] || w; }
+  function wordsOf(s) { return norm(s).split(' ').filter(function (w) { return w.length > 0; }).map(canon); }
+
+  // Word endings: physiotherapy / physiotherapist / physiotherapists share one stem.
+  function stem(w) {
+    if (w.length <= 3) return w;
+    var s = w;
+    if (/ies$/.test(s) && s.length > 4) s = s.slice(0, -3) + 'y';
+    else if (/(ss|us|is)$/.test(s)) { /* keep */ } else if (/s$/.test(s)) s = s.slice(0, -1);
+    if (/ing$/.test(s) && s.length > 5) s = s.slice(0, -3);
+    else if (/ist$/.test(s) && s.length > 5) s = s.slice(0, -3);
+    else if (/y$/.test(s) && s.length > 4) s = s.slice(0, -1);
+    if (/e$/.test(s) && s.length > 4) s = s.slice(0, -1);
+    return s;
   }
 
-  // Returns [{ r: listing, d: distanceKm | null }] filtered and sorted.
+  function withinOne(a, b) {
+    if (a === b) return true;
+    var la = a.length; var lb = b.length;
+    if (Math.abs(la - lb) > 1) return false;
+    var i = 0;
+    while (i < la && i < lb && a.charAt(i) === b.charAt(i)) i += 1;
+    if (la === lb) {
+      if (a.slice(i + 1) === b.slice(i + 1)) return true;
+      return i + 1 < la && a.charAt(i) === b.charAt(i + 1) && a.charAt(i + 1) === b.charAt(i) && a.slice(i + 2) === b.slice(i + 2);
+    }
+    return la > lb ? a.slice(i + 1) === b.slice(i) : b.slice(i + 1) === a.slice(i);
+  }
+
+  function indexListing(r) {
+    var tags = r.delivery.concat(r.cost, r.languages.map(function (l) { return LANGUAGE_NAMES[l] || l; }), r.accessibility ? [r.accessibility] : []).join(' ');
+    var types = r.subs.pro.concat(r.subs.well, r.subs.sup).join(' ')
+      + (r.groups.indexOf('sup') > -1 ? ' support group groups' : '') + (r.groups.indexOf('well') > -1 ? ' wellness program programs' : '');
+    var extra = r.keywords ? [].concat(r.keywords).join(' ') : '';   // optional staff-maintained search words
+    var fields = [[6, r.name], [5, types], [4, extra], [3, r.expertise], [2, tags], [1.5, r.description], [1, [r.city, r.province, r.postal].join(' ')]];
+    var exact = {};
+    var stems = {};
+    fields.forEach(function (f) {
+      wordsOf(f[1]).forEach(function (w) {
+        if (w.length < 2) return;
+        if (!exact[w] || exact[w] < f[0]) exact[w] = f[0];
+        var st = stem(w);
+        if (!stems[st] || stems[st] < f[0]) stems[st] = f[0];
+      });
+    });
+    var list = Object.keys(exact).map(function (w) { return { t: w, s: stem(w), w: exact[w] }; });
+    var fsa = /^[A-Za-z]\d[A-Za-z]/.test(r.postal || '') ? r.postal.slice(0, 3).toUpperCase() : '';
+    return { exact: exact, stems: stems, list: list, cityN: norm(r.city), provN: norm(r.province), fsa: fsa, nameN: norm(r.name) };
+  }
+
+  var idxCache = { src: null, val: null };
+  function buildIndex(all) {
+    if (idxCache.src === all) return idxCache.val;
+    var byId = {}; var cities = {}; var cityProv = {};
+    all.forEach(function (r) {
+      var ix = indexListing(r);
+      byId[r.id] = ix;
+      if (ix.cityN && !cities[ix.cityN]) { cities[ix.cityN] = r.city; cityProv[ix.cityN] = r.province; }
+    });
+    var provinces = {};
+    Object.keys(PROV_CODES).forEach(function (c) { provinces[norm(PROV_CODES[c])] = PROV_CODES[c]; });
+    idxCache = { src: all, val: { byId: byId, cities: cities, cityProv: cityProv, provinces: provinces } };
+    return idxCache.val;
+  }
+
+  // How well does one typed word match this listing? Returns the best weighted score (0 = no match).
+  function bestMatch(ix, t) {
+    var best = 0;
+    var w = ix.exact[t.t];
+    if (w) best = w;
+    if (t.s.length >= 3) { w = ix.stems[t.s]; if (w && w * 0.9 > best) best = w * 0.9; }
+    for (var i = 0; i < ix.list.length; i += 1) {
+      var wd = ix.list[i];
+      var q = 0;
+      if (t.t.length >= 3 && wd.t.indexOf(t.t) === 0) q = 0.8;
+      else if (t.s.length >= 4 && wd.s.indexOf(t.s) === 0) q = 0.75;
+      else if (t.t.length >= 5 && withinOne(t.t, wd.t)) q = 0.6;
+      else if (t.s.length >= 6 && withinOne(t.s, wd.s)) q = 0.55;   // a typo in a word that also ends differently (physiotherepy / physiotherapist)
+      if (q && wd.w * q > best) best = wd.w * q;
+    }
+    return best;
+  }
+
+  function tokObj(w) { return { t: w, s: stem(w) }; }
+  function makeTerm(toks, syns) {
+    var alts = [{ toks: toks.map(tokObj), f: 1 }];
+    syns.forEach(function (s) { alts.push({ toks: wordsOf(s).map(tokObj), f: 0.95 }); });
+    return { text: toks.join(' '), alts: alts };
+  }
+  function buildTerms(tokens) {
+    var terms = []; var i = 0;
+    while (i < tokens.length) {
+      var found = null; var len = Math.min(3, tokens.length - i);
+      for (; len >= 1; len -= 1) {
+        var phrase = tokens.slice(i, i + len).join(' ');
+        if (Object.prototype.hasOwnProperty.call(SYNONYMS, phrase)) { found = phrase; break; }
+      }
+      if (found) { terms.push(makeTerm(found.split(' '), SYNONYMS[found])); i += len; } else { terms.push(makeTerm([tokens[i]], [])); i += 1; }
+    }
+    return terms;
+  }
+  function termScore(ix, term) {
+    var best = 0;
+    for (var a = 0; a < term.alts.length; a += 1) {
+      var alt = term.alts[a]; var sum = 0; var ok = alt.toks.length > 0;
+      for (var k = 0; k < alt.toks.length && ok; k += 1) { var m = bestMatch(ix, alt.toks[k]); if (!m) ok = false; else sum += m; }
+      if (ok && (sum / alt.toks.length) * alt.f > best) best = (sum / alt.toks.length) * alt.f;
+    }
+    return best;
+  }
+
+  // Splits what was typed into what (terms) and where (loc). kwText / locText keep the original wording for the chips.
+  function parseQuery(q, index) {
+    var rawWords = String(q || '').trim().split(/\s+/).filter(Boolean);
+    var words = rawWords.map(function (w) { return { raw: w, n: wordsOf(w).join(' ') }; });
+    var used = {};
+    var loc = null;
+    function take(from, len, found) { for (var k = from; k < from + len; k += 1) used[k] = true; loc = found; locIdx = [from, len]; }
+    var locIdx = null;
+    var i; var len; var phrase;
+    // 1. postal code (K2K or K2K 1L1)
+    for (i = 0; i < words.length && !loc; i += 1) {
+      var c = words[i].n.replace(/ /g, '');
+      if (/^[a-z]\d[a-z]\d[a-z]\d$/.test(c)) take(i, 1, { type: 'postal', key: c.slice(0, 3).toUpperCase(), label: c.slice(0, 3).toUpperCase() });
+      else if (/^[a-z]\d[a-z]$/.test(c)) {
+        var nxt = words[i + 1] ? words[i + 1].n.replace(/ /g, '') : '';
+        take(i, /^\d[a-z]\d$/.test(nxt) ? 2 : 1, { type: 'postal', key: c.toUpperCase(), label: c.toUpperCase() });
+      }
+    }
+    // 2. province written as a two-letter code in capitals (ON, BC)
+    for (i = words.length - 1; i >= 0 && !loc; i -= 1) {
+      if (/^[A-Z]{2}$/.test(words[i].raw) && PROV_CODES[words[i].raw] && words.length > 1) take(i, 1, { type: 'province', key: norm(PROV_CODES[words[i].raw]), label: PROV_CODES[words[i].raw] });
+    }
+    // 3. a known city or province name (longest phrase first, rightmost first), then a one-typo version of a city
+    for (len = 3; len >= 1 && !loc; len -= 1) {
+      for (i = words.length - len; i >= 0 && !loc; i -= 1) {
+        var parts = words.slice(i, i + len).map(function (w) { return w.n; });
+        if (parts.some(function (p) { return !p; })) continue;
+        phrase = parts.join(' ');
+        if (index.cities[phrase]) take(i, len, { type: 'city', key: phrase, label: index.cities[phrase], province: index.cityProv[phrase] });
+        else if (index.provinces[phrase]) take(i, len, { type: 'province', key: phrase, label: index.provinces[phrase] });
+      }
+    }
+    for (i = words.length - 1; i >= 0 && !loc; i -= 1) {
+      var one = words[i].n;
+      if (one.length < 6 || one.indexOf(' ') > -1) continue;
+      var keys = Object.keys(index.cities);
+      for (var k = 0; k < keys.length; k += 1) {
+        if (keys[k].indexOf(' ') === -1 && keys[k].length >= 6 && withinOne(one, keys[k])) { take(i, 1, { type: 'city', key: keys[k], label: index.cities[keys[k]], province: index.cityProv[keys[k]] }); break; }
+      }
+    }
+    var kwRaw = []; var locRaw = []; var tokens = [];
+    words.forEach(function (w, idx) {
+      if (used[idx]) { locRaw.push(w.raw); return; }
+      var toks = w.n.split(' ').filter(function (t) { return t && t.length > 1 && !STOP[t]; });
+      if (!toks.length) return;                // filler such as "in" or "near" is not shown or searched
+      kwRaw.push(w.raw);
+      toks.forEach(function (t) { tokens.push(t); });
+    });
+    return { terms: buildTerms(tokens), loc: loc, kwText: kwRaw.join(' '), locText: locRaw.join(' ') };
+  }
+
+  function placeMatch(ix, loc) {
+    if (loc.type === 'city') return ix.cityN === loc.key;
+    if (loc.type === 'province') return ix.provN === loc.key;
+    return ix.fsa === loc.key;
+  }
+
+  // Returns [{ r: listing, d: distanceKm | null }] filtered and ranked. The array also carries .meta describing how the search was read.
   function applyFilters(all, s) {
-    var tokens = s.kw.toLowerCase().split(/\s+/).filter(Boolean);
-    var out = [];
+    var index = buildIndex(all);
+    var parsed = parseQuery(s.q !== undefined ? s.q : (s.kw || ''), index);
+    var loc = parsed.loc;
+    var geo = !!(loc && loc.type !== 'province');
+    var distOn = !!(geo && s.loc && (s.locKey === undefined || s.locKey === null || s.locKey === loc.key));
+    var legacyDistance = !!(!loc && s.loc && s.locKey === undefined);   // a bare distance filter with no place typed (used only by tests)
+    var terms = parsed.terms;
+    var rows = [];
     for (var i = 0; i < all.length; i += 1) {
       var r = all[i];
       if (s.group) {
@@ -52,27 +267,48 @@
       if (s.delivery.size && !intersects(r.delivery, s.delivery)) continue;
       if (s.cost.size && !intersects(r.cost, s.cost)) continue;
       if (s.lang.size && !intersects(r.languages, s.lang)) continue;
-      if (tokens.length) {
-        var h = haystack(r);
-        var ok = true;
-        for (var t = 0; t < tokens.length; t += 1) if (h.indexOf(tokens[t]) === -1) { ok = false; break; }
-        if (!ok) continue;
-      }
+      var ix = index.byId[r.id];
       var d = null;
-      if (s.loc && r.lat !== null && r.lng !== null) {
+      if (loc) {
+        var textHit = placeMatch(ix, loc);
+        var near = false;
+        if (distOn && r.lat !== null && r.lng !== null && r.lat !== undefined) {
+          d = haversineKm(s.loc.lat, s.loc.lng, r.lat, r.lng);
+          near = d <= s.km;
+        }
+        if (!textHit && !near) continue;
+      } else if (legacyDistance && r.lat !== null && r.lat !== undefined) {
         d = haversineKm(s.loc.lat, s.loc.lng, r.lat, r.lng);
         if (d > s.km) continue;
+      } else if (legacyDistance) continue;
+      var score = 0; var matched = 0;
+      for (var t = 0; t < terms.length; t += 1) {
+        var sc = termScore(ix, terms[t]);
+        if (sc > 0) { matched += 1; score += sc; }
       }
-      out.push({ r: r, d: d });
+      if (terms.length && ix.nameN.indexOf(norm(parsed.kwText)) > -1 && norm(parsed.kwText)) score += 3;
+      rows.push({ r: r, d: d, score: score, matched: matched });
     }
-    out.sort(function (a, b) {
-      if (s.loc) {
+    var partial = false;
+    if (terms.length) {
+      var full = rows.filter(function (x) { return x.matched === terms.length; });
+      if (full.length || terms.length < 2) rows = full;
+      else { rows = rows.filter(function (x) { return x.matched > 0; }); partial = rows.length > 0; }
+    }
+    var strong = function (x) { return terms.length ? (x.score / terms.length >= 3 ? 1 : 0) : 0; };
+    rows.sort(function (a, b) {
+      if (partial && a.matched !== b.matched) return b.matched - a.matched;
+      if (distOn || legacyDistance) {
+        if (strong(a) !== strong(b)) return strong(b) - strong(a);
         if (a.d === null && b.d !== null) return 1;
         if (a.d !== null && b.d === null) return -1;
         if (a.d !== null && b.d !== null && a.d !== b.d) return a.d - b.d;
       }
+      if (a.score !== b.score) return b.score - a.score;
       return byName(a.r, b.r);
     });
+    var out = rows.map(function (x) { return { r: x.r, d: x.d }; });
+    out.meta = { terms: terms, loc: loc, kwText: parsed.kwText, locText: parsed.locText, partial: partial, distanceOn: distOn || legacyDistance };
     return out;
   }
 
@@ -165,6 +401,7 @@
   }
 
   var api = {
+    parseQuery: parseQuery, buildIndex: buildIndex, stem: stem, norm: norm, withinOne: withinOne,
     groupByLocation: groupByLocation,
     applyFilters: applyFilters, subOptions: subOptions, languageOptions: languageOptions,
     pageList: pageList, truncate: truncate, extractPoint: extractPoint, haversineKm: haversineKm,
@@ -177,6 +414,9 @@
   // ---------- configuration ----------
   var cfg = window.CAREFINDER_CONFIG || {};
   var API_URL = cfg.api || root.getAttribute('data-api') || '';
+  if (cfg.synonyms) Object.keys(cfg.synonyms).forEach(function (k) { SYNONYMS[norm(k)] = cfg.synonyms[k]; });
+  var SEARCH_DELAY = cfg.searchDelay === undefined ? 200 : cfg.searchDelay;      // ms to wait after typing before searching
+  var LOCATION_DELAY = cfg.locationDelay === undefined ? 600 : cfg.locationDelay; // ms to wait before looking a place up
   var GEO_URL = cfg.geolocator || 'https://geolocator.api.geo.ca/';
   var PAGE_SIZE = cfg.pageSize || 10;
   // Map: Leaflet is loaded only when someone opens Map View. Integrity hashes are the ones published by leafletjs.com for 1.9.4.
@@ -279,6 +519,20 @@
     '.cf-pop-links{display:flex;flex-wrap:wrap;gap:4px 12px;font-weight:700;font-size:14px}',
     '.cf-pop-more{margin:8px 0 0;font-size:14px;color:var(--cf-muted)}',
     '@media (max-width:900px){.cf-map{height:440px}}',
+    /* single search box */
+    '.cf-searchlabel{display:block;font-weight:800;color:var(--cf-blue);font-size:18px;margin:0 0 6px}',
+    '.cf-search{display:flex;gap:12px;align-items:stretch;max-width:820px;margin:0 0 8px}',
+    '.cf-search input{flex:1;min-width:0;border:0;border-bottom:4px solid var(--cf-coral);border-radius:6px 6px 0 0;background:#fff;padding:14px 16px;font-size:18px}',
+    '.cf-search button{border:0;border-radius:6px;background:var(--cf-blue);color:#fff;padding:0 22px;font-weight:800;cursor:pointer;display:flex;align-items:center;gap:8px;font-size:17px}',
+    '.cf-hint{margin:0 0 12px;color:var(--cf-muted);font-size:15px}',
+    '.cf-chips{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 8px;padding:0;list-style:none}',
+    '.cf-chips:empty{display:none}',
+    '.cf-chip{display:inline-flex;align-items:center;gap:8px;background:#E8ECF8;color:var(--cf-blue);font-weight:700;border-radius:999px;padding:4px 6px 4px 14px;font-size:15px}',
+    '.cf-chip button{border:0;background:#fff;color:var(--cf-blue);width:26px;height:26px;border-radius:50%;cursor:pointer;font-weight:800;line-height:1;font-size:16px}',
+    '.cf-dist{max-width:420px;margin:0 0 12px}',
+    '.cf-dist[hidden]{display:none}',
+    '.cf-dist label{display:block;font-weight:700;color:var(--cf-blue)}',
+    '.cf-dist input{width:100%;accent-color:var(--cf-blue)}',
     '@media (max-width:900px){.cf-intro{grid-template-columns:1fr}.cf-selects,.cf-narrow{grid-template-columns:1fr}.cf-loc{grid-template-columns:1fr}.cf-body{grid-template-columns:1fr}.cf-filterhead h2{font-size:30px}.cf-count{font-size:26px}}',
     '@media (prefers-reduced-motion:reduce){.cf *{transition:none!important}}',
   ].join('\n');
@@ -322,8 +576,8 @@
 
   // ---------- state ----------
   var state = {
-    all: [], group: '', sub: '', kw: '', delivery: new Set(), cost: new Set(), lang: new Set(),
-    loc: null, km: 100, page: 1, open: {}, view: 'list',
+    all: [], group: '', sub: '', q: '', delivery: new Set(), cost: new Set(), lang: new Set(),
+    loc: null, locKey: null, locMsg: '', locErr: false, km: 50, page: 1, open: {}, view: 'list',
   };
   var els = {};
 
@@ -398,6 +652,7 @@
 
   function render() {
     var results = applyFilters(state.all, state);
+    updateSearchUI(results.meta);
     var pages = Math.max(1, Math.ceil(results.length / PAGE_SIZE));
     if (state.page > pages) state.page = pages;
     var slice = results.slice((state.page - 1) * PAGE_SIZE, state.page * PAGE_SIZE);
@@ -406,8 +661,8 @@
     els.list.textContent = '';
     if (!slice.length) {
       els.list.appendChild(h('li', null, [h('div', { class: 'cf-empty' }, [
-        h('h3', { text: 'No listings match these filters' }),
-        h('p', { text: 'Try removing a filter, searching a different keyword, or widening the distance.' }),
+        h('h3', { text: 'No listings match your search' }),
+        h('p', { text: 'Try fewer words, a different spelling, or removing a filter. You can also widen the distance.' }),
       ])]));
     } else {
       slice.forEach(function (item, i) { els.list.appendChild(renderCard(item, i)); });
@@ -494,7 +749,7 @@
         mapState.layer.addLayer(marker);
         points.push([g.lat, g.lng]);
       });
-      if (state.loc) {
+      if (results.meta && results.meta.distanceOn && state.loc) {
         mapState.layer.addLayer(L.circle([state.loc.lat, state.loc.lng], { radius: state.km * 1000, color: '#E25744', weight: 1.5, fillOpacity: 0.04, interactive: false }));
         mapState.layer.addLayer(L.circleMarker([state.loc.lat, state.loc.lng], { radius: 7, color: '#ffffff', weight: 2, fillColor: '#E25744', fillOpacity: 1 }).bindTooltip('Your search location'));
         points.push([state.loc.lat, state.loc.lng]);
@@ -527,27 +782,99 @@
     els.status.className = 'cf-status' + (isErr ? ' cf-err' : '');
   }
 
-  // ---------- location search (free NRCan Geolocator API, called from the visitor's browser) ----------
-  function findLocation(raw) {
-    var q = raw.trim();
-    if (!q) { state.loc = null; els.km.disabled = true; setStatus(''); refresh(); return; }
-    var postal = /^[A-Za-z]\d[A-Za-z]/.test(q);
-    var query = postal ? q.slice(0, 3).toUpperCase() : q;
-    var url = GEO_URL + '?q=' + encodeURIComponent(query) + '&lang=en&keys=' + (postal ? 'fsa' : 'geonames,fsa');
-    setStatus('Finding ' + query + '…');
+  // ---------- place lookup (free NRCan Geolocator API, called from the visitor's browser) ----------
+  var locCache = {};
+  var pendingKey = null;
+
+  function centroidOfCity(key) {
+    var idx = buildIndex(state.all); var n = 0; var la = 0; var lo = 0;
+    state.all.forEach(function (r) {
+      if (idx.byId[r.id].cityN === key && r.lat !== null && r.lat !== undefined) { n += 1; la += r.lat; lo += r.lng; }
+    });
+    return n ? { lat: la / n, lng: lo / n } : null;
+  }
+
+  function pickPoint(data, key, province) {
+    var all = Array.isArray(data) ? data : [];
+    var ofKey = all.filter(function (x) { return x && x.key === key; });
+    var pool = ofKey.length ? ofKey : all;
+    var inProv = province ? pool.filter(function (x) { return x && x.province === province; }) : [];
+    return extractPoint(inProv.length ? inProv : pool);
+  }
+
+  function setLocation(key, point) {
+    locCache[key] = point;
+    state.loc = point; state.locKey = key; state.locMsg = ''; state.locErr = false;
+    refresh();
+  }
+
+  function resolveLocation(loc) {
+    if (!loc || loc.type === 'province') {
+      var had = !!(state.loc || state.locMsg);
+      pendingKey = null; state.loc = null; state.locKey = null; state.locMsg = ''; state.locErr = false;
+      if (had) render();
+      return;
+    }
+    if (state.locKey === loc.key && state.loc) return;
+    state.loc = null; state.locKey = null;   // until it is found, listings are matched on their city / postal area text
+    if (locCache[loc.key]) { setLocation(loc.key, locCache[loc.key]); return; }
+    pendingKey = loc.key;
+    state.locMsg = 'Finding ' + loc.label + '…'; state.locErr = false;
+    var postal = loc.type === 'postal';
+    var key = postal ? 'fsa' : 'geonames';
+    var url = GEO_URL + '?q=' + encodeURIComponent(loc.label) + '&lang=en&keys=' + key;
     fetch(url).then(function (res) {
       if (!res.ok) throw new Error('lookup ' + res.status);
       return res.json();
     }).then(function (data) {
-      var p = extractPoint(data);
-      if (!p) { setStatus('We could not find that location. Try a postal code such as M5R or a city name.', true); return; }
-      state.loc = { lat: p.lat, lng: p.lng };
-      els.km.disabled = false;
-      setStatus('Showing listings within ' + state.km + ' km of ' + query + '. Listings without a known location appear last.');
-      refresh();
+      var p = pickPoint(data, key, postal ? '' : loc.province);
+      if (!p && !postal) p = centroidOfCity(loc.key);
+      if (pendingKey !== loc.key) return;
+      if (!p) {
+        state.locMsg = 'We could not find a map point for ' + loc.label + ', so only listings in that ' + (postal ? 'postal area' : 'city') + ' are shown.'; state.locErr = true;
+        render();
+        return;
+      }
+      setLocation(loc.key, p);
     }).catch(function () {
-      setStatus('Location search is unavailable right now. Try again in a moment.', true);
+      if (pendingKey !== loc.key) return;
+      var p = !postal ? centroidOfCity(loc.key) : null;
+      if (p) { setLocation(loc.key, p); return; }
+      state.locMsg = 'Place lookup is unavailable right now, so only listings in that ' + (postal ? 'postal area' : 'city') + ' are shown.'; state.locErr = true;
+      render();
     });
+    render();
+  }
+
+  function resolveFromQuery() {
+    resolveLocation(parseQuery(state.q, buildIndex(state.all)).loc);
+  }
+
+  function setQuery(text) {
+    els.input.value = text || '';
+    state.q = els.input.value;
+    resolveFromQuery();
+    refresh();
+    els.input.focus();
+  }
+
+  function chip(text, onRemove) {
+    return h('li', { class: 'cf-chip' }, [h('span', { text: text }), h('button', { type: 'button', 'aria-label': 'Remove ' + text, text: '×', onclick: onRemove })]);
+  }
+
+  // Shows how the search was understood, the distance slider when a place was typed, and any notice.
+  function updateSearchUI(meta) {
+    if (!els.chips || !meta) return;
+    els.chips.textContent = '';
+    if (meta.kwText) els.chips.appendChild(chip('Looking for: ' + meta.kwText, function () { setQuery(meta.locText); }));
+    var loc = meta.loc;
+    if (loc) els.chips.appendChild(chip((loc.type === 'province' ? 'In: ' : 'Near: ') + loc.label + (meta.distanceOn ? ' · ' + state.km + ' km' : ''), function () { setQuery(meta.kwText); }));
+    if (loc && loc.type !== 'province') els.distRow.removeAttribute('hidden'); else els.distRow.setAttribute('hidden', '');
+    var msg = ''; var err = false;
+    if (state.locMsg) { msg = state.locMsg; err = state.locErr; }
+    else if (meta.partial) msg = 'No listing matches all of your words. Showing listings that match some of them.';
+    else if (meta.distanceOn && loc) msg = 'Showing listings within ' + state.km + ' km of ' + loc.label + ', plus listings whose city is ' + loc.label + '.';
+    setStatus(msg, err);
   }
 
   // ---------- page shell ----------
@@ -599,14 +926,41 @@
     els.pages = h('nav', { class: 'cf-pages', 'aria-label': 'Pagination' });
     els.status = h('p', { class: 'cf-status', 'aria-live': 'polite' });
 
-    var kwInput = h('input', { type: 'search', id: 'cf-kw', placeholder: 'Search by keyword', 'aria-label': 'Search by keyword', oninput: function () { state.kw = kwInput.value; refresh(); } });
-    var kwRow = h('div', { class: 'cf-kw', hidden: true }, [kwInput]);
-    var kwToggle = h('button', { type: 'button', class: 'cf-linkbtn', 'aria-expanded': 'false', 'aria-controls': 'cf-kwrow', text: 'Search by keyword', onclick: function () {
-      var show = kwRow.hasAttribute('hidden');
-      if (show) { kwRow.removeAttribute('hidden'); kwInput.focus(); } else { kwRow.setAttribute('hidden', ''); kwInput.value = ''; state.kw = ''; refresh(); }
-      kwToggle.setAttribute('aria-expanded', show ? 'true' : 'false');
+    var typeTimer = null; var placeTimer = null;
+    els.input = h('input', {
+      type: 'search', id: 'cf-search', autocomplete: 'off', 'aria-describedby': 'cf-hint',
+      placeholder: 'e.g. physiotherapy Ottawa',
+      oninput: function () {
+        state.q = els.input.value;
+        clearTimeout(typeTimer); clearTimeout(placeTimer);
+        typeTimer = setTimeout(refresh, SEARCH_DELAY);
+        placeTimer = setTimeout(resolveFromQuery, LOCATION_DELAY);
+      },
+      onkeydown: function (e) { if (e.key === 'Enter') { e.preventDefault(); submitSearch(); } },
+    });
+    function submitSearch() {
+      clearTimeout(typeTimer); clearTimeout(placeTimer);
+      state.q = els.input.value;
+      resolveFromQuery();
+      refresh();
+    }
+    var searchBox = h('div', { role: 'search' }, [
+      h('label', { class: 'cf-searchlabel', for: 'cf-search', text: 'Search by service, organization or place' }),
+      h('div', { class: 'cf-search' }, [
+        els.input,
+        h('button', { type: 'button', onclick: submitSearch }, [icon(SEARCH, 20), h('span', { text: 'Search' })]),
+      ]),
+      h('p', { class: 'cf-hint', id: 'cf-hint', text: 'Try “physiotherapy Ottawa”, “support group”, “speech therapy Toronto” or a postal code such as K2K.' }),
+    ]);
+    els.chips = h('ul', { class: 'cf-chips', 'aria-label': 'How your search was understood' });
+    var kmLabel = h('label', { for: 'cf-km', text: 'Distance (km): ' + state.km });
+    els.km = h('input', { type: 'range', id: 'cf-km', min: 5, max: 500, step: 5, value: state.km, oninput: function () {
+      state.km = Number(els.km.value);
+      kmLabel.textContent = 'Distance (km): ' + state.km;
+      render();
     } });
-    kwRow.id = 'cf-kwrow';
+    els.distRow = h('div', { class: 'cf-dist', hidden: true }, [kmLabel, els.km]);
+    var focusSearch = h('button', { type: 'button', class: 'cf-linkbtn', text: 'Search by keyword or place', onclick: function () { els.input.focus(); } });
 
     var narrow = h('div', { class: 'cf-narrow', id: 'cf-narrow', hidden: true }, [
       checkGroup('Availability', DELIVERY, state.delivery),
@@ -618,19 +972,6 @@
       if (show) narrow.removeAttribute('hidden'); else narrow.setAttribute('hidden', '');
       narrowBtn.setAttribute('aria-expanded', show ? 'true' : 'false');
     } }, [h('span', { text: 'Narrow the results' }), icon(CHEVRON, 18)]);
-
-    var locInput = h('input', { type: 'text', id: 'cf-loc', placeholder: 'Postal code or city', autocomplete: 'postal-code', onkeydown: function (e) { if (e.key === 'Enter') { e.preventDefault(); findLocation(locInput.value); } } });
-    var kmLabel = h('label', { for: 'cf-km', text: 'Distance (km): ' + state.km });
-    els.km = h('input', { type: 'range', id: 'cf-km', min: 5, max: 500, step: 5, value: state.km, disabled: true, oninput: function () {
-      state.km = Number(els.km.value);
-      kmLabel.textContent = 'Distance (km): ' + state.km;
-      if (state.loc) { refresh(); }
-    } });
-    var locBlock = h('div', { class: 'cf-loc' }, [
-      h('div', null, [h('label', { for: 'cf-loc', text: 'Search near you' }),
-        h('div', { class: 'cf-locrow' }, [locInput, h('button', { type: 'button', 'aria-label': 'Search location', onclick: function () { findLocation(locInput.value); } }, [icon(SEARCH, 22)])])]),
-      h('div', { class: 'cf-range' }, [kmLabel, els.km]),
-    ]);
 
     els.viewList = h('button', { type: 'button', 'aria-pressed': 'true', text: 'List View', onclick: function () { setView('list'); } });
     els.viewMap = h('button', { type: 'button', 'aria-pressed': 'false', text: 'Map View', onclick: function () { setView('map'); } });
@@ -647,14 +988,15 @@
     var inner = h('div', { class: 'cf-inner' }, [
       buildIntro(),
       h('div', { class: 'cf-filterhead' }, [
-        h('h2', { text: 'Filter by category' }), h('span', { class: 'cf-or', text: 'or' }), kwToggle,
+        h('h2', { text: 'Filter by category' }), h('span', { class: 'cf-or', text: 'or' }), focusSearch,
       ]),
       h('div', { class: 'cf-selects' }, [buildSelect('pro'), buildSelect('well'), buildSelect('sup')]),
-      kwRow,
+      searchBox,
+      els.chips,
+      els.distRow,
       h('div', { class: 'cf-bar' }, [els.count, toggle]),
       h('div', { class: 'cf-narrowrow' }, [narrowBtn]),
       narrow,
-      locBlock,
       els.status,
       els.list,
       els.mapWrap,
