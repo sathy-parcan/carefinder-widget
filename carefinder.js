@@ -960,7 +960,6 @@
       render();
     } });
     els.distRow = h('div', { class: 'cf-dist', hidden: true }, [kmLabel, els.km]);
-    var focusSearch = h('button', { type: 'button', class: 'cf-linkbtn', text: 'Search by keyword or place', onclick: function () { els.input.focus(); } });
 
     var narrow = h('div', { class: 'cf-narrow', id: 'cf-narrow', hidden: true }, [
       checkGroup('Availability', DELIVERY, state.delivery),
@@ -988,7 +987,7 @@
     var inner = h('div', { class: 'cf-inner' }, [
       buildIntro(),
       h('div', { class: 'cf-filterhead' }, [
-        h('h2', { text: 'Filter by category' }), h('span', { class: 'cf-or', text: 'or' }), focusSearch,
+        h('h2', { text: 'Filter by category' }),
       ]),
       h('div', { class: 'cf-selects' }, [buildSelect('pro'), buildSelect('well'), buildSelect('sup')]),
       searchBox,
