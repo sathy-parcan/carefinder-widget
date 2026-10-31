@@ -7,14 +7,14 @@
 
   // ---------- pure logic (also exercised by test/run.mjs) ----------
   var GROUPS = {
-    pro: { label: 'Healthcare professionals', all: 'All healthcare professionals' },
+    pro: { label: 'Health care professionals', all: 'All health care professionals' },
     well: { label: 'Health and wellness programs', all: 'All health and wellness programs' },
     sup: { label: 'Support groups', all: 'All support groups' },
   };
   var LANGUAGE_NAMES = { EN: 'English', FR: 'French', ES: 'Spanish', FIL: 'Filipino', HI: 'Hindi', PA: 'Punjabi', ZH: 'Chinese' };
   var LANGUAGE_ORDER = ['EN', 'ES', 'FIL', 'FR', 'HI', 'PA', 'ZH'];
-  var DELIVERY = ['In-person', 'In-home', 'Virtual'];
-  var COST = ['Free', 'Fee-based', 'Donation'];
+  var DELIVERY = ['In-person', 'In-home', 'Hybrid', 'Virtual'];
+  var COST = ['Free', 'Client paid', 'Donation-based'];
 
   function haversineKm(lat1, lon1, lat2, lon2) {
     var r = Math.PI / 180;
@@ -33,6 +33,77 @@
     for (var i = 0; i < have.length; i += 1) if (wanted.has(have[i])) return true;
     return false;
   }
+
+  // ---------- listing helpers ----------
+  // Listings published before the cost wording / medical-allied split changed are tidied on arrival.
+  function prepareListing(l) {
+    var seen = {};
+    l.cost = (l.cost || []).map(function (c) { return c === 'Fee-based' ? 'Client paid' : c === 'Donation' ? 'Donation-based' : c; })
+      .filter(function (c) { if (seen[c]) return false; seen[c] = true; return true; });
+    var subs = l.subs || { pro: [], well: [], sup: [] };
+    if (!subs.medical) {
+      subs.medical = [];
+      subs.allied = (subs.pro || []).filter(function (v) { return v !== 'Home care'; });
+      subs.home = (subs.pro || []).indexOf('Home care') > -1 ? ['Home care'] : [];
+    }
+    l.subs = subs;
+    l.added = l.added || '';
+    return l;
+  }
+
+  // One key per category a listing belongs to, e.g. pro|med|Neurologist, pro|allied|Physiotherapist, well|Boxing, sup|*.
+  function catKeysOf(r) {
+    var keys = [];
+    r.groups.forEach(function (g) { keys.push(g + '|*'); });
+    (r.subs.medical || []).forEach(function (v) { keys.push('pro|med|' + v); });
+    (r.subs.allied || []).forEach(function (v) { keys.push('pro|allied|' + v); });
+    (r.subs.home || []).forEach(function (v) { keys.push('pro|home|' + v); });
+    r.subs.well.forEach(function (v) { keys.push('well|' + v); });
+    r.subs.sup.forEach(function (v) { keys.push('sup|' + v); });
+    return keys;
+  }
+
+  function sortedKeys(o) { return Object.keys(o).sort(function (a, b) { return a.localeCompare(b, 'en', { sensitivity: 'base' }); }); }
+
+  // What each category dropdown offers (only options that at least one listing has).
+  function categoryOptions(all) {
+    var med = {}; var allied = {}; var home = {}; var well = {}; var sup = {};
+    all.forEach(function (r) {
+      (r.subs.medical || []).forEach(function (v) { med[v] = true; });
+      (r.subs.allied || []).forEach(function (v) { allied[v] = true; });
+      (r.subs.home || []).forEach(function (v) { home[v] = true; });
+      r.subs.well.forEach(function (v) { well[v] = true; });
+      r.subs.sup.forEach(function (v) { sup[v] = true; });
+    });
+    var items = function (o, prefix) { return sortedKeys(o).map(function (v) { return { key: prefix + v, label: v }; }); };
+    return {
+      pro: [
+        { title: 'Medical providers', items: items(med, 'pro|med|') },
+        { title: 'Allied health care', items: items(allied, 'pro|allied|') },
+        { title: 'Home care', items: items(home, 'pro|home|') },
+      ].filter(function (sec) { return sec.items.length; }),
+      well: [{ title: '', items: items(well, 'well|') }].filter(function (sec) { return sec.items.length; }),
+      sup: [{ title: '', items: items(sup, 'sup|') }].filter(function (sec) { return sec.items.length; }),
+    };
+  }
+
+  // A hybrid service offers both in-person and virtual care, so it also appears when either of those is ticked.
+  function deliveryMatches(r, wanted, hybridCounts) {
+    var hasHybrid = r.delivery.indexOf('Hybrid') > -1;
+    var hit = false;
+    wanted.forEach(function (w) {
+      if (r.delivery.indexOf(w) > -1) hit = true;
+      else if (hybridCounts && hasHybrid && (w === 'In-person' || w === 'Virtual')) hit = true;
+    });
+    return hit;
+  }
+
+  function hash32(str) {
+    var h = 2166136261;
+    for (var i = 0; i < str.length; i += 1) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619); }
+    return h >>> 0;
+  }
+  function todayKey() { return new Date().toISOString().slice(0, 10); }
 
   // ---------- search engine ----------
   // One search box. The words typed are split into WHAT (service words) and WHERE (a postal code, a city or a province),
@@ -257,14 +328,16 @@
     var distOn = !!(geo && s.loc && (s.locKey === undefined || s.locKey === null || s.locKey === loc.key));
     var legacyDistance = !!(!loc && s.loc && s.locKey === undefined);   // a bare distance filter with no place typed (used only by tests)
     var terms = parsed.terms;
+    var hybridCounts = !(typeof cfg !== 'undefined' && cfg && cfg.hybridCounts === false);
     var rows = [];
     for (var i = 0; i < all.length; i += 1) {
       var r = all[i];
-      if (s.group) {
-        if (r.groups.indexOf(s.group) === -1) continue;
-        if (s.sub && s.sub !== '__all' && r.subs[s.group].indexOf(s.sub) === -1) continue;
+      if (s.cats && s.cats.size) {
+        var ck = catKeysOf(r); var inCat = false;
+        for (var c = 0; c < ck.length; c += 1) { if (s.cats.has(ck[c])) { inCat = true; break; } }
+        if (!inCat) continue;
       }
-      if (s.delivery.size && !intersects(r.delivery, s.delivery)) continue;
+      if (s.delivery.size && !deliveryMatches(r, s.delivery, hybridCounts)) continue;
       if (s.cost.size && !intersects(r.cost, s.cost)) continue;
       if (s.lang.size && !intersects(r.languages, s.lang)) continue;
       var ix = index.byId[r.id];
@@ -296,7 +369,20 @@
       else { rows = rows.filter(function (x) { return x.matched > 0; }); partial = rows.length > 0; }
     }
     var strong = function (x) { return terms.length ? (x.score / terms.length >= 3 ? 1 : 0) : 0; };
+    var searching = !!(terms.length || distOn || legacyDistance);
+    // "relevance" = best match / nearest; with nothing typed the default is newest first.
+    var mode = s.sort;
+    if (mode === 'relevance' && !searching) mode = 'recent';
+    if (!mode) mode = searching ? 'relevance' : 'recent';
+    var day = s.today || todayKey();
+    var shuffle = function (r) { return hash32(r.id + day); };
     rows.sort(function (a, b) {
+      if (mode === 'az') return byName(a.r, b.r);
+      if (mode === 'recent') {
+        if (a.r.added !== b.r.added) return a.r.added < b.r.added ? 1 : -1;   // newest first; listings added the same day rotate daily
+        var ha = shuffle(a.r); var hb = shuffle(b.r);
+        return ha !== hb ? ha - hb : byName(a.r, b.r);
+      }
       if (partial && a.matched !== b.matched) return b.matched - a.matched;
       if (distOn || legacyDistance) {
         if (strong(a) !== strong(b)) return strong(b) - strong(a);
@@ -308,16 +394,8 @@
       return byName(a.r, b.r);
     });
     var out = rows.map(function (x) { return { r: x.r, d: x.d }; });
-    out.meta = { terms: terms, loc: loc, kwText: parsed.kwText, locText: parsed.locText, partial: partial, distanceOn: distOn || legacyDistance };
+    out.meta = { terms: terms, loc: loc, kwText: parsed.kwText, locText: parsed.locText, partial: partial, distanceOn: distOn || legacyDistance, sort: mode, searching: searching };
     return out;
-  }
-
-  function subOptions(all, group) {
-    var seen = {};
-    all.forEach(function (r) {
-      r.subs[group].forEach(function (v) { seen[v] = true; });
-    });
-    return Object.keys(seen).sort(function (a, b) { return a.localeCompare(b, 'en', { sensitivity: 'base' }); });
   }
 
   function languageOptions(all) {
@@ -402,8 +480,9 @@
 
   var api = {
     parseQuery: parseQuery, buildIndex: buildIndex, stem: stem, norm: norm, withinOne: withinOne,
+    categoryOptions: categoryOptions, prepareListing: prepareListing, catKeysOf: catKeysOf, hash32: hash32,
     groupByLocation: groupByLocation,
-    applyFilters: applyFilters, subOptions: subOptions, languageOptions: languageOptions,
+    applyFilters: applyFilters, languageOptions: languageOptions,
     pageList: pageList, truncate: truncate, extractPoint: extractPoint, haversineKm: haversineKm,
   };
   if (typeof window !== 'undefined' && window.__CAREFINDER_EXPOSE__) window.__CAREFINDER_TEST__ = api;
@@ -519,6 +598,31 @@
     '.cf-pop-links{display:flex;flex-wrap:wrap;gap:4px 12px;font-weight:700;font-size:14px}',
     '.cf-pop-more{margin:8px 0 0;font-size:14px;color:var(--cf-muted)}',
     '@media (max-width:900px){.cf-map{height:440px}}',
+    /* multi-select dropdowns */
+    '.cf-dd{position:relative}',
+    '.cf-ddbtn{width:100%;display:flex;align-items:center;justify-content:space-between;gap:10px;background:#fff;border:0;border-bottom:4px solid var(--cf-coral);border-radius:6px 6px 0 0;padding:16px 18px 14px;font-size:18px;font-weight:700;color:var(--cf-blue);cursor:pointer;text-align:left}',
+    '.cf-ddbtn[aria-expanded="true"] svg{transform:rotate(180deg)}',
+    '.cf-ddcount{background:var(--cf-blue);color:#fff;border-radius:999px;font-size:14px;min-width:26px;height:26px;padding:0 8px;display:inline-flex;align-items:center;justify-content:center;margin-left:auto}',
+    '.cf-ddcount[hidden]{display:none}',
+    '.cf-ddpanel{position:absolute;left:0;right:0;top:100%;z-index:40;background:#fff;border-radius:0 0 12px 12px;box-shadow:0 12px 28px rgba(15,25,60,.22);max-height:400px;overflow:auto;padding:8px 18px 14px}',
+    '.cf-ddpanel[hidden]{display:none}',
+    '.cf-ddhead{display:flex;justify-content:flex-end;padding:4px 0 8px;border-bottom:1px solid var(--cf-line);margin-bottom:10px}',
+    '.cf-ddclear:disabled{opacity:.4;cursor:default;text-decoration:none}',
+    '.cf-ddsec{border:0;margin:0 0 6px;padding:0;min-width:0}',
+    '.cf-ddsec legend{color:var(--cf-coral-ink);font-size:14px;letter-spacing:.04em;text-transform:uppercase;padding:8px 0 6px}',
+    /* sort, share and shared-listing panel */
+    '.cf-barright{display:flex;flex-wrap:wrap;align-items:center;gap:12px 20px}',
+    '.cf-sort{display:flex;align-items:center;gap:8px;font-weight:700;color:var(--cf-blue)}',
+    '.cf-sort[hidden]{display:none}',
+    '.cf-sort select{border:0;border-bottom:3px solid var(--cf-coral);background:#fff;border-radius:6px 6px 0 0;padding:8px 10px;font-weight:700;color:var(--cf-blue);font-size:16px;cursor:pointer}',
+    '.cf-topright{display:flex;align-items:center;gap:14px;font-weight:700;color:var(--cf-muted)}',
+    '.cf-share{display:inline-flex;align-items:center;gap:6px;background:none;border:0;padding:2px 0;cursor:pointer;color:var(--cf-blue);font-weight:800;font-size:15px;text-decoration:underline;text-underline-offset:3px}',
+    '.cf-focus{margin:0 0 36px;padding:24px;background:#fff;border:3px solid var(--cf-coral);border-radius:16px}',
+    '.cf-focus[hidden]{display:none}',
+    '.cf-focus h2{color:var(--cf-blue);font-size:26px;margin:0 0 14px}',
+    '.cf-focus .cf-card{box-shadow:none;border:1px solid var(--cf-line);margin:0 0 16px}',
+    '.cf-pop-item-btn{margin-top:6px}',
+    '.cf-live{position:absolute;left:-9999px;width:1px;height:1px;overflow:hidden}',
     /* single search box */
     '.cf-searchlabel{display:block;font-weight:800;color:var(--cf-blue);font-size:18px;margin:0 0 6px}',
     '.cf-search{display:flex;gap:12px;align-items:stretch;max-width:820px;margin:0 0 8px}',
@@ -573,10 +677,11 @@
   var CHEVRON = 'M6 9l6 6 6-6';
   var UP = 'M6 15l6-6 6 6';
   var SEARCH = 'M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14zm9 16l-4-4';
+  var LINK = 'M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1M14 10a4 4 0 0 0-5.7 0l-3 3A4 4 0 0 0 11 18.7l1-1';
 
   // ---------- state ----------
   var state = {
-    all: [], group: '', sub: '', q: '', delivery: new Set(), cost: new Set(), lang: new Set(),
+    all: [], cats: new Set(), q: '', sort: null, focus: null, delivery: new Set(), cost: new Set(), lang: new Set(),
     loc: null, locKey: null, locMsg: '', locErr: false, km: 50, page: 1, open: {}, view: 'list',
   };
   var els = {};
@@ -599,6 +704,71 @@
   function addressText(r) {
     var line = [r.address, [r.city, r.province].filter(Boolean).join(', '), r.postal].filter(Boolean).join('\n');
     return line;
+  }
+
+  function listingUrl(id) {
+    var base = cfg.shareUrl || (window.location.origin + window.location.pathname);
+    return base + (base.indexOf('?') > -1 ? '&' : '?') + 'listing=' + encodeURIComponent(id);
+  }
+  function copyText(text) {
+    if (navigator.clipboard && navigator.clipboard.writeText) return navigator.clipboard.writeText(text);
+    return new Promise(function (resolve, reject) {
+      var ta = h('textarea', { 'aria-hidden': 'true', style: 'position:fixed;left:-9999px' });
+      ta.value = text;
+      document.body.appendChild(ta);
+      ta.select();
+      var ok = false;
+      try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+      document.body.removeChild(ta);
+      if (ok) resolve(); else reject(new Error('copy failed'));
+    });
+  }
+  function shareButton(r) {
+    var label = h('span', { text: 'Share' });
+    var btn = h('button', { type: 'button', class: 'cf-share', 'aria-label': 'Copy a link to ' + r.name }, [icon(LINK, 16), label]);
+    btn.addEventListener('click', function () {
+      var url = listingUrl(r.id);
+      copyText(url).then(function () {
+        label.textContent = 'Link copied';
+        els.live.textContent = 'Link to ' + r.name + ' copied';
+        setTimeout(function () { label.textContent = 'Share'; els.live.textContent = ''; }, 2500);
+      }).catch(function () { window.prompt('Copy this link', url); });
+    });
+    return btn;
+  }
+
+  function setListingParam(id) {
+    try {
+      var u = new URL(window.location.href);
+      if (id) u.searchParams.set('listing', id); else u.searchParams.delete('listing');
+      window.history.replaceState(null, '', u.toString());
+    } catch (e) { /* the address bar is optional */ }
+  }
+  // A single listing shown at the top, for shared links and the map's "View full details".
+  function renderFocus() {
+    if (!els.focus) return;
+    els.focus.textContent = '';
+    if (!state.focus) { els.focus.setAttribute('hidden', ''); return; }
+    var found = null;
+    state.all.forEach(function (l) { if (l.id === state.focus) found = l; });
+    var close = h('button', { type: 'button', class: 'cf-linkbtn', text: 'Browse all CareFinder listings', onclick: clearFocus });
+    if (found) state.open[found.id] = true;
+    els.focus.appendChild(found
+      ? h('div', null, [h('h2', { text: 'Listing details' }), h('ul', { class: 'cf-list' }, [renderCard({ r: found, d: null }, 'focus')]), close])
+      : h('div', null, [h('h2', { text: 'This listing is no longer available' }), h('p', { text: 'It may have been updated or removed. You can still browse every CareFinder listing.' }), close]));
+    els.focus.removeAttribute('hidden');
+  }
+  function focusListing(id) {
+    state.focus = id;
+    setListingParam(id);
+    renderFocus();
+    setView('list');
+    root.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+  function clearFocus() {
+    state.focus = null;
+    setListingParam(null);
+    renderFocus();
   }
 
   function renderCard(item, idx) {
@@ -635,7 +805,7 @@
     return h('li', null, [h('article', { class: 'cf-card' }, [
       h('div', { class: 'cf-top' }, [
         h('span', { text: locationLabel(r) }),
-        item.d !== null ? h('span', { text: Math.round(item.d) + ' km away' }) : null,
+        h('span', { class: 'cf-topright' }, [item.d !== null ? h('span', { text: Math.round(item.d) + ' km away' }) : null, shareButton(r)]),
       ]),
       h('div', { class: 'cf-body' }, [
         h('div', null, [
@@ -715,6 +885,7 @@
         h('p', { class: 'cf-pop-name', text: r.name }),
         h('p', { class: 'cf-pop-meta', text: locationLabel(r) }),
         links.length ? h('div', { class: 'cf-pop-links' }, links) : null,
+        h('button', { type: 'button', class: 'cf-linkbtn cf-pop-item-btn', text: 'View full details', onclick: function () { focusListing(r.id); } }),
       ]);
     }));
     return h('div', { class: 'cf-pop' }, [
@@ -765,6 +936,7 @@
 
   function setView(v) {
     state.view = v;
+    if (v === 'map') els.sortWrap.setAttribute('hidden', ''); else els.sortWrap.removeAttribute('hidden');
     els.viewList.setAttribute('aria-pressed', v === 'list' ? 'true' : 'false');
     els.viewMap.setAttribute('aria-pressed', v === 'map' ? 'true' : 'false');
     if (v === 'map') {
@@ -866,6 +1038,12 @@
   function updateSearchUI(meta) {
     if (!els.chips || !meta) return;
     els.chips.textContent = '';
+    state.cats.forEach(function (key) {
+      els.chips.appendChild(chip(els.catLabels[key] || key, function () { state.cats.delete(key); syncDropdowns(); refresh(); }));
+    });
+    // the sort menu offers Best match only while something has been searched for
+    if (meta.searching) els.optRel.removeAttribute('disabled'); else els.optRel.setAttribute('disabled', '');
+    els.sort.value = meta.sort;
     if (meta.kwText) els.chips.appendChild(chip('Looking for: ' + meta.kwText, function () { setQuery(meta.locText); }));
     var loc = meta.loc;
     if (loc) els.chips.appendChild(chip((loc.type === 'province' ? 'In: ' : 'Near: ') + loc.label + (meta.distanceOn ? ' · ' + state.km + ' km' : ''), function () { setQuery(meta.kwText); }));
@@ -888,20 +1066,82 @@
     })));
   }
 
-  function buildSelect(group) {
-    var g = GROUPS[group];
-    var sel = h('select', { class: 'cf-select', 'aria-label': g.label, 'data-group': group }, [
-      h('option', { value: '', text: g.label }),
-      h('option', { value: '__all', text: g.all }),
-    ].concat(subOptions(state.all, group).map(function (v) { return h('option', { value: v, text: v }); })));
-    sel.addEventListener('change', function () {
-      Object.keys(els.selects).forEach(function (k) { if (k !== group) els.selects[k].value = ''; });
-      state.group = sel.value ? group : '';
-      state.sub = sel.value;
-      refresh();
+  // ----- multi-select category dropdowns -----
+  var DD_GROUPS = ['pro', 'well', 'sup'];
+  function groupCount(group) {
+    var n = 0;
+    state.cats.forEach(function (k) { if (k.indexOf(group + '|') === 0) n += 1; });
+    return n;
+  }
+  function closeDropdowns(except) {
+    DD_GROUPS.forEach(function (g) {
+      var dd = els.dd[g];
+      if (!dd || g === except) return;
+      dd.panel.setAttribute('hidden', ''); dd.btn.setAttribute('aria-expanded', 'false');
     });
-    els.selects[group] = sel;
-    return sel;
+  }
+  // Brings every dropdown (counts, ticks, Clear selections) back in line with state.cats.
+  function syncDropdowns() {
+    DD_GROUPS.forEach(function (g) {
+      var dd = els.dd[g];
+      if (!dd) return;
+      var n = groupCount(g);
+      dd.badge.textContent = String(n);
+      if (n) dd.badge.removeAttribute('hidden'); else dd.badge.setAttribute('hidden', '');
+      dd.btn.setAttribute('aria-label', GROUPS[g].label + (n ? ', ' + n + ' selected' : ''));
+      dd.clear.disabled = n === 0;
+    });
+    Object.keys(els.catBoxes).forEach(function (k) { els.catBoxes[k].checked = state.cats.has(k); });
+  }
+  function clearGroup(group) {
+    var drop = [];
+    state.cats.forEach(function (k) { if (k.indexOf(group + '|') === 0) drop.push(k); });
+    drop.forEach(function (k) { state.cats.delete(k); });
+    syncDropdowns();
+    refresh();
+  }
+
+  function buildDropdown(group) {
+    var g = GROUPS[group];
+    var sections = categoryOptions(state.all)[group];
+    var panelId = 'cf-dd-' + group;
+    var badge = h('span', { class: 'cf-ddcount', hidden: true, text: '0' });
+    var btn = h('button', { type: 'button', class: 'cf-ddbtn', 'aria-expanded': 'false', 'aria-controls': panelId, 'aria-label': g.label }, [
+      h('span', { text: g.label }), badge, icon(CHEVRON, 16),
+    ]);
+    var clear = h('button', { type: 'button', class: 'cf-linkbtn cf-ddclear', text: 'Clear selections', disabled: true, onclick: function () { clearGroup(group); } });
+    var panel = h('div', { class: 'cf-ddpanel', id: panelId, role: 'group', 'aria-label': g.label + ' options', hidden: true }, [h('div', { class: 'cf-ddhead' }, [clear])]);
+
+    function addBox(parent, key, label) {
+      els.catLabels[key] = label;
+      var input = h('input', { type: 'checkbox', value: key, onchange: function () {
+        if (input.checked) state.cats.add(key); else state.cats.delete(key);
+        syncDropdowns();
+        refresh();
+      } });
+      els.catBoxes[key] = input;
+      parent.appendChild(h('label', { class: 'cf-check' }, [input, h('span', { text: label })]));
+    }
+    var all = h('div', null);
+    addBox(all, group + '|*', g.all);
+    panel.appendChild(all);
+    sections.forEach(function (sec) {
+      var fs = h('fieldset', { class: 'cf-ddsec' }, sec.title ? [h('legend', { text: sec.title })] : []);
+      sec.items.forEach(function (it) { addBox(fs, it.key, it.label); });
+      panel.appendChild(fs);
+    });
+
+    btn.addEventListener('click', function () {
+      var open = panel.hasAttribute('hidden');
+      closeDropdowns(group);
+      if (open) { panel.removeAttribute('hidden'); btn.setAttribute('aria-expanded', 'true'); } else { panel.setAttribute('hidden', ''); btn.setAttribute('aria-expanded', 'false'); }
+    });
+    var box = h('div', { class: 'cf-dd' }, [btn, panel]);
+    box.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape' && !panel.hasAttribute('hidden')) { panel.setAttribute('hidden', ''); btn.setAttribute('aria-expanded', 'false'); btn.focus(); }
+    });
+    els.dd[group] = { btn: btn, badge: badge, panel: panel, clear: clear, box: box };
+    return box;
   }
 
   function buildIntro() {
@@ -920,7 +1160,9 @@
   }
 
   function build() {
-    els.selects = {};
+    els.dd = {}; els.catBoxes = {}; els.catLabels = {};
+    els.live = h('div', { class: 'cf-live', 'aria-live': 'polite' });
+    els.focus = h('div', { class: 'cf-focus', hidden: true });
     els.count = h('h2', { class: 'cf-count', 'aria-live': 'polite', text: '' });
     els.list = h('ul', { class: 'cf-list' });
     els.pages = h('nav', { class: 'cf-pages', 'aria-label': 'Pagination' });
@@ -975,6 +1217,11 @@
     els.viewList = h('button', { type: 'button', 'aria-pressed': 'true', text: 'List View', onclick: function () { setView('list'); } });
     els.viewMap = h('button', { type: 'button', 'aria-pressed': 'false', text: 'Map View', onclick: function () { setView('map'); } });
     var toggle = h('div', { class: 'cf-toggle', role: 'group', 'aria-label': 'Choose how to view results' }, [els.viewList, els.viewMap]);
+    els.optRel = h('option', { value: 'relevance', text: 'Best match', disabled: true });
+    els.sort = h('select', { id: 'cf-sort', onchange: function () { state.sort = els.sort.value; render(); } }, [
+      h('option', { value: 'recent', text: 'Recently added' }), h('option', { value: 'az', text: 'Name (A–Z)' }), els.optRel,
+    ]);
+    els.sortWrap = h('div', { class: 'cf-sort' }, [h('label', { for: 'cf-sort', text: 'Sort by' }), els.sort]);
     els.mapNote = h('p', { class: 'cf-status', 'aria-live': 'polite' });
     els.mapEl = h('div', { class: 'cf-map', role: 'region', 'aria-label': 'Map of CareFinder listings' });
     els.mapWrap = h('div', { class: 'cf-map-wrap', hidden: true }, [els.mapNote, els.mapEl]);
@@ -986,14 +1233,15 @@
 
     var inner = h('div', { class: 'cf-inner' }, [
       buildIntro(),
+      els.focus,
       h('div', { class: 'cf-filterhead' }, [
         h('h2', { text: 'Filter by category' }),
       ]),
-      h('div', { class: 'cf-selects' }, [buildSelect('pro'), buildSelect('well'), buildSelect('sup')]),
+      h('div', { class: 'cf-selects' }, [buildDropdown('pro'), buildDropdown('well'), buildDropdown('sup')]),
       searchBox,
       els.chips,
       els.distRow,
-      h('div', { class: 'cf-bar' }, [els.count, toggle]),
+      h('div', { class: 'cf-bar' }, [els.count, h('div', { class: 'cf-barright' }, [els.sortWrap, toggle])]),
       h('div', { class: 'cf-narrowrow' }, [narrowBtn]),
       narrow,
       els.status,
@@ -1002,7 +1250,14 @@
       els.pages,
     ]);
     root.textContent = '';
-    root.appendChild(h('div', { class: 'cf' }, [inner, topBtn]));
+    root.appendChild(h('div', { class: 'cf' }, [inner, topBtn, els.live]));
+    document.addEventListener('click', function (e) {
+      if (!e || !e.target) return;
+      DD_GROUPS.forEach(function (g) {
+        var dd = els.dd[g];
+        if (dd && typeof dd.box.contains === 'function' && !dd.box.contains(e.target)) { dd.panel.setAttribute('hidden', ''); dd.btn.setAttribute('aria-expanded', 'false'); }
+      });
+    });
   }
 
   // ---------- start ----------
@@ -1018,9 +1273,13 @@
       if (!res.ok) throw new Error('listings ' + res.status);
       return res.json();
     }).then(function (data) {
-      state.all = (data.listings || []).filter(function (l) { return l && l.name; });
+      state.all = (data.listings || []).filter(function (l) { return l && l.name; }).map(prepareListing);
+      var shared = null;
+      try { shared = new URLSearchParams(window.location.search).get('listing'); } catch (e) { shared = null; }
+      if (shared) { state.focus = shared; state.open[shared] = true; }
       build();
       render();
+      if (shared) { renderFocus(); root.scrollIntoView({ behavior: 'auto', block: 'start' }); }
     }).catch(function () {
       root.textContent = '';
       root.appendChild(h('div', { class: 'cf' }, [h('div', { class: 'cf-inner' }, [h('div', { class: 'cf-empty' }, [
