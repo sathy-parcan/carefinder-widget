@@ -498,6 +498,9 @@
   var LOCATION_DELAY = cfg.locationDelay === undefined ? 600 : cfg.locationDelay; // ms to wait before looking a place up
   var GEO_URL = cfg.geolocator || 'https://geolocator.api.geo.ca/';
   var PAGE_SIZE = cfg.pageSize || 10;
+  // The share-link parameter. A plain "listing" clashes with WordPress sites that have a content type or category of that
+  // name (WordPress then returns a 404 before this script loads), so the default is a prefixed name. The old name is still read.
+  var SHARE_PARAM = cfg.shareParam || 'cf_listing';
   // Map: Leaflet is loaded only when someone opens Map View. Integrity hashes are the ones published by leafletjs.com for 1.9.4.
   var LEAFLET = cfg.leaflet || {
     css: 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css', cssIntegrity: 'sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=',
@@ -708,7 +711,7 @@
 
   function listingUrl(id) {
     var base = cfg.shareUrl || (window.location.origin + window.location.pathname);
-    return base + (base.indexOf('?') > -1 ? '&' : '?') + 'listing=' + encodeURIComponent(id);
+    return base + (base.indexOf('?') > -1 ? '&' : '?') + SHARE_PARAM + '=' + encodeURIComponent(id);
   }
   function copyText(text) {
     if (navigator.clipboard && navigator.clipboard.writeText) return navigator.clipboard.writeText(text);
@@ -740,7 +743,8 @@
   function setListingParam(id) {
     try {
       var u = new URL(window.location.href);
-      if (id) u.searchParams.set('listing', id); else u.searchParams.delete('listing');
+      u.searchParams.delete('listing');
+      if (id) u.searchParams.set(SHARE_PARAM, id); else u.searchParams.delete(SHARE_PARAM);
       window.history.replaceState(null, '', u.toString());
     } catch (e) { /* the address bar is optional */ }
   }
@@ -1275,7 +1279,7 @@
     }).then(function (data) {
       state.all = (data.listings || []).filter(function (l) { return l && l.name; }).map(prepareListing);
       var shared = null;
-      try { shared = new URLSearchParams(window.location.search).get('listing'); } catch (e) { shared = null; }
+      try { var qs = new URLSearchParams(window.location.search); shared = qs.get(SHARE_PARAM) || qs.get('listing'); } catch (e) { shared = null; }
       if (shared) { state.focus = shared; state.open[shared] = true; }
       build();
       render();
